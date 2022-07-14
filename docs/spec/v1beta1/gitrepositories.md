@@ -19,8 +19,8 @@ type GitRepositorySpec struct {
 	// The secret name containing the Git credentials.
 	// For HTTPS repositories the secret must contain username and password
 	// fields.
-	// For SSH repositories the secret must contain identity, identity.pub and
-	// known_hosts fields.
+	// For SSH repositories the secret must contain identity and known_hosts
+  // fields.
 	// +optional
 	SecretRef *corev1.LocalObjectReference `json:"secretRef,omitempty"`
 
@@ -28,7 +28,7 @@ type GitRepositorySpec struct {
 	// +required
 	Interval metav1.Duration `json:"interval"`
 
-	// The timeout for remote Git operations like cloning, defaults to 20s.
+	// The timeout for remote Git operations like cloning, defaults to 60s.
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 
@@ -57,6 +57,14 @@ type GitRepositorySpec struct {
 	// +kubebuilder:default:=go-git
 	// +optional
 	GitImplementation string `json:"gitImplementation,omitempty"`
+
+	// When enabled, after the clone is created, initializes all submodules within.
+	// This option is available only when using the 'go-git' GitImplementation.
+	// +optional
+	RecurseSubmodules bool `json:"recurseSubmodules,omitempty"`
+
+	// Extra git repositories to map into the repository
+	Include []GitRepositoryInclude `json:"include,omitempty"`
 }
 ```
 
@@ -144,9 +152,13 @@ gzip compressed TAR archive (`<commit hash>.tar.gz`).
 
 ### Excluding files
 
-Git files (`.git/`, `.gitignore`, `.gitmodules`, and `.gitattributes`) are
-excluded from the archive by default, as well as some extensions (`.jpg, .jpeg,
-.gif, .png, .wmv, .flv, .tar.gz, .zip`)
+The following files and extensions are excluded from the archive by default:
+
+- Git files (`.git/ ,.gitignore, .gitmodules, .gitattributes`)
+- File extensions (`.jpg, .jpeg, .gif, .png, .wmv, .flv, .tar.gz, .zip`)
+- CI configs (`.github/, .circleci/, .travis.yml, .gitlab-ci.yml, appveyor.yml, .drone.yml, cloudbuild.yaml, codeship-services.yml, codeship-steps.yml`)
+- CLI configs (`.goreleaser.yml, .sops.yaml`)
+- Flux v1 config (`.flux.yaml`)
 
 Excluding additional files from the archive is possible by adding a
 `.sourceignore` file in the root of the repository. The `.sourceignore` file
@@ -185,7 +197,7 @@ comes with its own set of drawbacks.
 
 Some git providers like Azure DevOps require that the git client supports specific capabilities
 to be able to communicate. The initial library used in source-controller did not support
-this functionality while other libraries that did were missinging other critical functionality,
+this functionality while other libraries that did were missing other critical functionality,
 specifically the ability to do shallow cloning. Shallow cloning is important as it allows
 source-controller to only fetch the latest commits, instead of the whole git history.
 For some very large repositories this means downloading GB of data that could fill the disk
@@ -194,10 +206,10 @@ and also impact the traffic costs.
 To be able to support Azure DevOps a compromise solution was built, giving the user the
 option to select the git library while accepting the drawbacks.
 
-| Git Implementation | Shallow Clones | V2 Protocol Support |
-|---|---|---|
-| 'go-git' | true | false |
-| 'libgit2' | false | true |
+| Git Implementation | Shallow Clones | Git Submodules | V2 Protocol Support |
+| ---                | ---            | ---            | ---                 |
+| 'go-git'           | true           | true           | false               |
+| 'libgit2'          | false          | false          | true                |
 
 Pull the master branch from a repository in Azure DevOps.
 
@@ -212,6 +224,21 @@ spec:
   url: https://dev.azure.com/org/proj/_git/repo
   gitImplementation: libgit2
 ```
+
+## Git Proxy
+
+A Git proxy can be configured by setting the appropriate environment variables
+for proxy configurations, for example `HTTPS_PROXY`, `NO_PROXY`, etc., in the
+source-controller pod. There may be some limitations in the proxy support based
+on the Git implementations.
+
+| Git Implementation | HTTP_PROXY | HTTPS_PROXY | NO_PROXY | Self-signed Certs |
+| ---                | ---        | ---         | ---      | ---               |
+| 'go-git'           | true       | true        | true     | false             |
+| 'libgit2'          | false      | true        | false    | true              |
+
+**NOTE:** libgit2 v1.2.0 supports `NO_PROXY`, but source-controller uses
+libgit2 v1.1.1 at the moment.
 
 ## Spec examples
 
@@ -258,6 +285,21 @@ spec:
   url: https://github.com/stefanprodan/podinfo
   ref:
     branch: master
+    commit: 363a6a8fe6a7f13e05d34c163b0ef02a777da20a
+```
+
+Checkout a specific commit:
+
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1beta1
+kind: GitRepository
+metadata:
+  name: podinfo
+  namespace: default
+spec:
+  interval: 1m
+  url: https://github.com/stefanprodan/podinfo
+  ref:
     commit: 363a6a8fe6a7f13e05d34c163b0ef02a777da20a
 ```
 
@@ -318,7 +360,36 @@ data:
   password: <BASE64>
 ```
 
-> **Note:** that self-signed certificates are not supported.
+### HTTPS self-signed certificates
+
+Cloning over HTTPS from a Git repository with a self-signed certificate:
+
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1beta1
+kind: GitRepository
+metadata:
+  name: podinfo
+  namespace: default
+spec:
+  interval: 1m
+  url: https://customdomain.com/stefanprodan/podinfo
+  secretRef:
+    name: https-credentials
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: https-credentials
+  namespace: default
+type: Opaque
+data:
+  username: <BASE64>
+  password: <BASE64>
+  caFile: <BASE64>
+```
+
+It is also possible to specify a `caFile` for public repositories, in that case the username and password
+can be omitted.
 
 ### SSH authentication
 
@@ -363,6 +434,17 @@ kubectl create secret generic ssh-credentials \
     --from-file=./known_hosts
 ```
 
+If your SSH key is protected with a passphrase,
+you can specify it in the Kubernetes secret under the `password` key:
+
+```sh
+kubectl create secret generic ssh-credentials \
+    --from-file=./identity \
+    --from-file=./identity.pub \
+    --from-file=./known_hosts \
+    --from-literal=password=<passphrase>
+```
+
 ### GPG signature verification
 
 Verify the OpenPGP signature for the commit that master branch HEAD points to:
@@ -404,6 +486,99 @@ kubectl create secret generic pgp-public-keys \
     --from-file=author1.asc \
     --from-file=author2.asc
 ```
+
+### Git submodules
+
+With `spec.recurseSubmodules` you can configure the controller to
+clone a specific branch including its Git submodules:
+
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1beta1
+kind: GitRepository
+metadata:
+  name: repo-with-submodules
+  namespace: default
+spec:
+  interval: 1m
+  url: https://github.com/<organization>/<repository>
+  secretRef:
+    name: https-credentials
+  ref:
+    branch: main
+  recurseSubmodules: true
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: https-credentials
+  namespace: default
+type: Opaque
+data:
+  username: <GitHub Username>
+  password: <GitHub Token>
+```
+
+Note that deploy keys can't be used to pull submodules from private repositories
+as GitHub and GitLab doesn't allow a deploy key to be reused across repositories.
+You have to use either HTTPS token-based authentication, or an SSH key belonging
+to a user that has access to the main repository and all its submodules.
+
+### Including GitRepository
+
+With `spec.include` you can map the contents of a Git repository into another.
+This may look identical to Git submodules but has multiple benefits over
+regular submodules:
+
+* Including a `GitRepository` allows you to use different authentication methods for different repositories.
+* A change in the included repository will trigger an update of the including repository.
+* Multiple `GitRepositories` could include the same repository, which decreases the amount of cloning done compared to using submodules.
+
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1beta1
+kind: GitRepository
+metadata:
+  name: app-repo
+  namespace: default
+spec:
+  interval: 1m
+  url: https://github.com/<org>/app-repo
+  secretRef:
+    name: https-credentials
+  ref:
+    branch: main
+---
+apiVersion: source.toolkit.fluxcd.io/v1beta1
+kind: GitRepository
+metadata:
+  name: config-repo
+  namespace: default
+spec:
+  interval: 1m
+  url: https://github.com/<org>/config-repo
+  secretRef:
+    name: https-credentials
+  ref:
+    branch: main
+  include:
+    - repository:
+        name: app-repo
+      fromPath: deploy/kubernetes
+      toPath: base/app
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: https-credentials
+  namespace: default
+type: Opaque
+data:
+  username: <GitHub Username>
+  password: <GitHub Token>
+```
+
+The `fromPath` and `toPath` parameters allows you to limit the files included and where they will be
+copied to in the main repository. If you do not specify a value for `fromPath` all files in the
+repository will be included. The `toPath` value will default to the name of the repository.
 
 ## Status examples
 

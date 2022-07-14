@@ -9,6 +9,8 @@ spec:
     matchLabels:
       app: source-controller
   replicas: 1
+  strategy:
+    type: Recreate
   template:
     metadata:
       labels:
@@ -18,6 +20,10 @@ spec:
         prometheus.io/port: "8080"
     spec:
       terminationGracePeriodSeconds: 10
+      securityContext:
+        # Required for AWS IAM Role bindings
+        # https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts-technical-overview.html
+        fsGroup: 1337
       containers:
       - name: manager
         image: fluxcd/source-controller
@@ -25,11 +31,21 @@ spec:
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop: [ "ALL" ]
+          seccompProfile:
+            type: RuntimeDefault
         ports:
           - containerPort: 9090
             name: http
+            protocol: TCP
           - containerPort: 8080
             name: http-prom
+            protocol: TCP
+          - containerPort: 9440
+            name: healthz
+            protocol: TCP
         env:
           - name: RUNTIME_NAMESPACE
             valueFrom:
@@ -38,13 +54,14 @@ spec:
         args:
           - --watch-all-namespaces
           - --log-level=info
-          - --log-json
+          - --log-encoding=json
           - --enable-leader-election
           - --storage-path=/data
+          - --storage-adv-addr=source-controller.$(RUNTIME_NAMESPACE).svc.cluster.local.
         livenessProbe:
           httpGet:
-            port: http
-            path: /
+            port: healthz
+            path: /healthz
         readinessProbe:
           httpGet:
             port: http

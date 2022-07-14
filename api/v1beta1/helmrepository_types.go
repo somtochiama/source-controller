@@ -17,10 +17,11 @@ limitations under the License.
 package v1beta1
 
 import (
-	"github.com/fluxcd/pkg/apis/meta"
-	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/fluxcd/pkg/apis/acl"
+	"github.com/fluxcd/pkg/apis/meta"
 )
 
 const (
@@ -44,7 +45,16 @@ type HelmRepositorySpec struct {
 	// For TLS the secret must contain a certFile and keyFile, and/or
 	// caCert fields.
 	// +optional
-	SecretRef *corev1.LocalObjectReference `json:"secretRef,omitempty"`
+	SecretRef *meta.LocalObjectReference `json:"secretRef,omitempty"`
+
+	// PassCredentials allows the credentials from the SecretRef to be passed on to
+	// a host that does not match the host as defined in URL.
+	// This may be required if the host of the advertised chart URLs in the index
+	// differ from the defined URL.
+	// Enabling this should be done with caution, as it can potentially result in
+	// credentials getting stolen in a MITM-attack.
+	// +optional
+	PassCredentials bool `json:"passCredentials,omitempty"`
 
 	// The interval at which to check the upstream for updates.
 	// +required
@@ -58,6 +68,10 @@ type HelmRepositorySpec struct {
 	// This flag tells the controller to suspend the reconciliation of this source.
 	// +optional
 	Suspend bool `json:"suspend,omitempty"`
+
+	// AccessFrom defines an Access Control List for allowing cross-namespace references to this object.
+	// +optional
+	AccessFrom *acl.AccessFrom `json:"accessFrom,omitempty"`
 }
 
 // HelmRepositoryStatus defines the observed state of the HelmRepository.
@@ -99,7 +113,13 @@ func HelmRepositoryProgressing(repository HelmRepository) HelmRepository {
 	repository.Status.ObservedGeneration = repository.Generation
 	repository.Status.URL = ""
 	repository.Status.Conditions = []metav1.Condition{}
-	meta.SetResourceCondition(&repository, meta.ReadyCondition, metav1.ConditionUnknown, meta.ProgressingReason, "reconciliation in progress")
+	newCondition := metav1.Condition{
+		Type:    meta.ReadyCondition,
+		Status:  metav1.ConditionUnknown,
+		Reason:  meta.ProgressingReason,
+		Message: "reconciliation in progress",
+	}
+	apimeta.SetStatusCondition(repository.GetStatusConditions(), newCondition)
 	return repository
 }
 
@@ -109,7 +129,13 @@ func HelmRepositoryProgressing(repository HelmRepository) HelmRepository {
 func HelmRepositoryReady(repository HelmRepository, artifact Artifact, url, reason, message string) HelmRepository {
 	repository.Status.Artifact = &artifact
 	repository.Status.URL = url
-	meta.SetResourceCondition(&repository, meta.ReadyCondition, metav1.ConditionTrue, reason, message)
+	newCondition := metav1.Condition{
+		Type:    meta.ReadyCondition,
+		Status:  metav1.ConditionTrue,
+		Reason:  reason,
+		Message: message,
+	}
+	apimeta.SetStatusCondition(repository.GetStatusConditions(), newCondition)
 	return repository
 }
 
@@ -117,7 +143,13 @@ func HelmRepositoryReady(repository HelmRepository, artifact Artifact, url, reas
 // HelmRepository to 'False', with the given reason and message. It returns the
 // modified HelmRepository.
 func HelmRepositoryNotReady(repository HelmRepository, reason, message string) HelmRepository {
-	meta.SetResourceCondition(&repository, meta.ReadyCondition, metav1.ConditionFalse, reason, message)
+	newCondition := metav1.Condition{
+		Type:    meta.ReadyCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: message,
+	}
+	apimeta.SetStatusCondition(repository.GetStatusConditions(), newCondition)
 	return repository
 }
 
@@ -151,6 +183,7 @@ func (in *HelmRepository) GetInterval() metav1.Duration {
 // +genclient
 // +genclient:Namespaced
 // +kubebuilder:object:root=true
+// +kubebuilder:resource:shortName=helmrepo
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="URL",type=string,JSONPath=`.spec.url`
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type==\"Ready\")].status",description=""
@@ -162,7 +195,8 @@ type HelmRepository struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   HelmRepositorySpec   `json:"spec,omitempty"`
+	Spec HelmRepositorySpec `json:"spec,omitempty"`
+	// +kubebuilder:default={"observedGeneration":-1}
 	Status HelmRepositoryStatus `json:"status,omitempty"`
 }
 

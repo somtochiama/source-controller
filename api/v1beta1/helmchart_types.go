@@ -17,9 +17,11 @@ limitations under the License.
 package v1beta1
 
 import (
-	"github.com/fluxcd/pkg/apis/meta"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/fluxcd/pkg/apis/acl"
+	"github.com/fluxcd/pkg/apis/meta"
 )
 
 // HelmChartKind is the string representation of a HelmChart.
@@ -45,15 +47,46 @@ type HelmChartSpec struct {
 	// +required
 	Interval metav1.Duration `json:"interval"`
 
-	// Alternative values file to use as the default chart values, expected to be a
-	// relative path in the SourceRef. Ignored when omitted.
+	// Determines what enables the creation of a new artifact. Valid values are
+	// ('ChartVersion', 'Revision').
+	// See the documentation of the values for an explanation on their behavior.
+	// Defaults to ChartVersion when omitted.
+	// +kubebuilder:validation:Enum=ChartVersion;Revision
+	// +kubebuilder:default:=ChartVersion
 	// +optional
+	ReconcileStrategy string `json:"reconcileStrategy,omitempty"`
+
+	// Alternative list of values files to use as the chart values (values.yaml
+	// is not included by default), expected to be a relative path in the SourceRef.
+	// Values files are merged in the order of this list with the last file overriding
+	// the first. Ignored when omitted.
+	// +optional
+	ValuesFiles []string `json:"valuesFiles,omitempty"`
+
+	// Alternative values file to use as the default chart values, expected to
+	// be a relative path in the SourceRef. Deprecated in favor of ValuesFiles,
+	// for backwards compatibility the file defined here is merged before the
+	// ValuesFiles items. Ignored when omitted.
+	// +optional
+	// +deprecated
 	ValuesFile string `json:"valuesFile,omitempty"`
 
 	// This flag tells the controller to suspend the reconciliation of this source.
 	// +optional
 	Suspend bool `json:"suspend,omitempty"`
+
+	// AccessFrom defines an Access Control List for allowing cross-namespace references to this object.
+	// +optional
+	AccessFrom *acl.AccessFrom `json:"accessFrom,omitempty"`
 }
+
+const (
+	// ReconcileStrategyChartVersion reconciles when the version of the Helm chart is different.
+	ReconcileStrategyChartVersion string = "ChartVersion"
+
+	// ReconcileStrategyRevision reconciles when the Revision of the source is different.
+	ReconcileStrategyRevision string = "Revision"
+)
 
 // LocalHelmChartSourceReference contains enough information to let you locate
 // the typed referenced object at namespace level.
@@ -119,7 +152,13 @@ func HelmChartProgressing(chart HelmChart) HelmChart {
 	chart.Status.ObservedGeneration = chart.Generation
 	chart.Status.URL = ""
 	chart.Status.Conditions = []metav1.Condition{}
-	meta.SetResourceCondition(&chart, meta.ReadyCondition, metav1.ConditionUnknown, meta.ProgressingReason, "reconciliation in progress")
+	newCondition := metav1.Condition{
+		Type:    meta.ReadyCondition,
+		Status:  metav1.ConditionUnknown,
+		Reason:  meta.ProgressingReason,
+		Message: "reconciliation in progress",
+	}
+	apimeta.SetStatusCondition(chart.GetStatusConditions(), newCondition)
 	return chart
 }
 
@@ -129,7 +168,13 @@ func HelmChartProgressing(chart HelmChart) HelmChart {
 func HelmChartReady(chart HelmChart, artifact Artifact, url, reason, message string) HelmChart {
 	chart.Status.Artifact = &artifact
 	chart.Status.URL = url
-	meta.SetResourceCondition(&chart, meta.ReadyCondition, metav1.ConditionTrue, reason, message)
+	newCondition := metav1.Condition{
+		Type:    meta.ReadyCondition,
+		Status:  metav1.ConditionTrue,
+		Reason:  reason,
+		Message: message,
+	}
+	apimeta.SetStatusCondition(chart.GetStatusConditions(), newCondition)
 	return chart
 }
 
@@ -137,7 +182,13 @@ func HelmChartReady(chart HelmChart, artifact Artifact, url, reason, message str
 // 'False', with the given reason and message. It returns the modified
 // HelmChart.
 func HelmChartNotReady(chart HelmChart, reason, message string) HelmChart {
-	meta.SetResourceCondition(&chart, meta.ReadyCondition, metav1.ConditionFalse, reason, message)
+	newCondition := metav1.Condition{
+		Type:    meta.ReadyCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: message,
+	}
+	apimeta.SetStatusCondition(chart.GetStatusConditions(), newCondition)
 	return chart
 }
 
@@ -168,9 +219,21 @@ func (in *HelmChart) GetInterval() metav1.Duration {
 	return in.Spec.Interval
 }
 
+// GetValuesFiles returns a merged list of ValuesFiles.
+func (in *HelmChart) GetValuesFiles() []string {
+	valuesFiles := in.Spec.ValuesFiles
+
+	// Prepend the deprecated ValuesFile to the list
+	if in.Spec.ValuesFile != "" {
+		valuesFiles = append([]string{in.Spec.ValuesFile}, valuesFiles...)
+	}
+	return valuesFiles
+}
+
 // +genclient
 // +genclient:Namespaced
 // +kubebuilder:object:root=true
+// +kubebuilder:resource:shortName=hc
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Chart",type=string,JSONPath=`.spec.chart`
 // +kubebuilder:printcolumn:name="Version",type=string,JSONPath=`.spec.version`
@@ -185,7 +248,8 @@ type HelmChart struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   HelmChartSpec   `json:"spec,omitempty"`
+	Spec HelmChartSpec `json:"spec,omitempty"`
+	// +kubebuilder:default={"observedGeneration":-1}
 	Status HelmChartStatus `json:"status,omitempty"`
 }
 

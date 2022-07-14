@@ -17,10 +17,11 @@ limitations under the License.
 package v1beta1
 
 import (
-	"github.com/fluxcd/pkg/apis/meta"
-	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/fluxcd/pkg/apis/acl"
+	"github.com/fluxcd/pkg/apis/meta"
 )
 
 const (
@@ -31,7 +32,7 @@ const (
 // BucketSpec defines the desired state of an S3 compatible bucket
 type BucketSpec struct {
 	// The S3 compatible storage provider name, default ('generic').
-	// +kubebuilder:validation:Enum=generic;aws
+	// +kubebuilder:validation:Enum=generic;aws;gcp
 	// +kubebuilder:default:=generic
 	// +optional
 	Provider string `json:"provider,omitempty"`
@@ -55,14 +56,14 @@ type BucketSpec struct {
 	// The name of the secret containing authentication credentials
 	// for the Bucket.
 	// +optional
-	SecretRef *corev1.LocalObjectReference `json:"secretRef,omitempty"`
+	SecretRef *meta.LocalObjectReference `json:"secretRef,omitempty"`
 
 	// The interval at which to check for bucket updates.
 	// +required
 	Interval metav1.Duration `json:"interval"`
 
-	// The timeout for download operations, defaults to 20s.
-	// +kubebuilder:default="20s"
+	// The timeout for download operations, defaults to 60s.
+	// +kubebuilder:default="60s"
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 
@@ -75,11 +76,16 @@ type BucketSpec struct {
 	// This flag tells the controller to suspend the reconciliation of this source.
 	// +optional
 	Suspend bool `json:"suspend,omitempty"`
+
+	// AccessFrom defines an Access Control List for allowing cross-namespace references to this object.
+	// +optional
+	AccessFrom *acl.AccessFrom `json:"accessFrom,omitempty"`
 }
 
 const (
 	GenericBucketProvider string = "generic"
 	AmazonBucketProvider  string = "aws"
+	GoogleBucketProvider  string = "gcp"
 )
 
 // BucketStatus defines the observed state of a bucket
@@ -120,7 +126,13 @@ func BucketProgressing(bucket Bucket) Bucket {
 	bucket.Status.ObservedGeneration = bucket.Generation
 	bucket.Status.URL = ""
 	bucket.Status.Conditions = []metav1.Condition{}
-	meta.SetResourceCondition(&bucket, meta.ReadyCondition, metav1.ConditionUnknown, meta.ProgressingReason, "reconciliation in progress")
+	newCondition := metav1.Condition{
+		Type:    meta.ReadyCondition,
+		Status:  metav1.ConditionUnknown,
+		Reason:  meta.ProgressingReason,
+		Message: "reconciliation in progress",
+	}
+	apimeta.SetStatusCondition(bucket.GetStatusConditions(), newCondition)
 	return bucket
 }
 
@@ -130,14 +142,26 @@ func BucketProgressing(bucket Bucket) Bucket {
 func BucketReady(bucket Bucket, artifact Artifact, url, reason, message string) Bucket {
 	bucket.Status.Artifact = &artifact
 	bucket.Status.URL = url
-	meta.SetResourceCondition(&bucket, meta.ReadyCondition, metav1.ConditionTrue, reason, message)
+	newCondition := metav1.Condition{
+		Type:    meta.ReadyCondition,
+		Status:  metav1.ConditionTrue,
+		Reason:  reason,
+		Message: message,
+	}
+	apimeta.SetStatusCondition(bucket.GetStatusConditions(), newCondition)
 	return bucket
 }
 
 // BucketNotReady sets the meta.ReadyCondition on the Bucket to 'False', with
 // the given reason and message. It returns the modified Bucket.
 func BucketNotReady(bucket Bucket, reason, message string) Bucket {
-	meta.SetResourceCondition(&bucket, meta.ReadyCondition, metav1.ConditionFalse, reason, message)
+	newCondition := metav1.Condition{
+		Type:    meta.ReadyCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: message,
+	}
+	apimeta.SetStatusCondition(bucket.GetStatusConditions(), newCondition)
 	return bucket
 }
 
@@ -172,7 +196,7 @@ func (in *Bucket) GetInterval() metav1.Duration {
 // +genclient:Namespaced
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="URL",type=string,JSONPath=`.spec.url`
+// +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.spec.endpoint`
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type==\"Ready\")].status",description=""
 // +kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.conditions[?(@.type==\"Ready\")].message",description=""
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description=""
@@ -182,7 +206,8 @@ type Bucket struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   BucketSpec   `json:"spec,omitempty"`
+	Spec BucketSpec `json:"spec,omitempty"`
+	// +kubebuilder:default={"observedGeneration":-1}
 	Status BucketStatus `json:"status,omitempty"`
 }
 

@@ -17,18 +17,20 @@ limitations under the License.
 package v1beta1
 
 import (
-	"github.com/fluxcd/pkg/apis/meta"
-	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/fluxcd/pkg/apis/acl"
+	"github.com/fluxcd/pkg/apis/meta"
 )
 
 const (
 	// GitRepositoryKind is the string representation of a GitRepository.
 	GitRepositoryKind = "GitRepository"
-	// Represents the go-git git implementation kind
+
+	// GoGitImplementation represents the go-git Git implementation kind.
 	GoGitImplementation = "go-git"
-	// Represents the gi2go git implementation kind
+	// LibGit2Implementation represents the git2go Git implementation kind.
 	LibGit2Implementation = "libgit2"
 )
 
@@ -42,17 +44,17 @@ type GitRepositorySpec struct {
 	// The secret name containing the Git credentials.
 	// For HTTPS repositories the secret must contain username and password
 	// fields.
-	// For SSH repositories the secret must contain identity, identity.pub and
-	// known_hosts fields.
+	// For SSH repositories the secret must contain identity and known_hosts
+	// fields.
 	// +optional
-	SecretRef *corev1.LocalObjectReference `json:"secretRef,omitempty"`
+	SecretRef *meta.LocalObjectReference `json:"secretRef,omitempty"`
 
 	// The interval at which to check for repository updates.
 	// +required
 	Interval metav1.Duration `json:"interval"`
 
-	// The timeout for remote Git operations like cloning, defaults to 20s.
-	// +kubebuilder:default="20s"
+	// The timeout for remote Git operations like cloning, defaults to 60s.
+	// +kubebuilder:default="60s"
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 
@@ -81,12 +83,49 @@ type GitRepositorySpec struct {
 	// +kubebuilder:default:=go-git
 	// +optional
 	GitImplementation string `json:"gitImplementation,omitempty"`
+
+	// When enabled, after the clone is created, initializes all submodules within,
+	// using their default settings.
+	// This option is available only when using the 'go-git' GitImplementation.
+	// +optional
+	RecurseSubmodules bool `json:"recurseSubmodules,omitempty"`
+
+	// Extra git repositories to map into the repository
+	Include []GitRepositoryInclude `json:"include,omitempty"`
+
+	// AccessFrom defines an Access Control List for allowing cross-namespace references to this object.
+	// +optional
+	AccessFrom *acl.AccessFrom `json:"accessFrom,omitempty"`
+}
+
+func (in *GitRepositoryInclude) GetFromPath() string {
+	return in.FromPath
+}
+
+func (in *GitRepositoryInclude) GetToPath() string {
+	if in.ToPath == "" {
+		return in.GitRepositoryRef.Name
+	}
+	return in.ToPath
+}
+
+// GitRepositoryInclude defines a source with a from and to path.
+type GitRepositoryInclude struct {
+	// Reference to a GitRepository to include.
+	GitRepositoryRef meta.LocalObjectReference `json:"repository"`
+
+	// The path to copy contents from, defaults to the root directory.
+	// +optional
+	FromPath string `json:"fromPath"`
+
+	// The path to copy contents to, defaults to the name of the source ref.
+	// +optional
+	ToPath string `json:"toPath"`
 }
 
 // GitRepositoryRef defines the Git ref used for pull and checkout operations.
 type GitRepositoryRef struct {
 	// The Git branch to checkout, defaults to master.
-	// +kubebuilder:default:=master
 	// +optional
 	Branch string `json:"branch,omitempty"`
 
@@ -110,7 +149,7 @@ type GitRepositoryVerification struct {
 	Mode string `json:"mode"`
 
 	// The secret name containing the public keys of all trusted Git authors.
-	SecretRef corev1.LocalObjectReference `json:"secretRef,omitempty"`
+	SecretRef meta.LocalObjectReference `json:"secretRef,omitempty"`
 }
 
 // GitRepositoryStatus defines the observed state of a Git repository.
@@ -131,6 +170,10 @@ type GitRepositoryStatus struct {
 	// Artifact represents the output of the last successful repository sync.
 	// +optional
 	Artifact *Artifact `json:"artifact,omitempty"`
+
+	// IncludedArtifacts represents the included artifacts from the last successful repository sync.
+	// +optional
+	IncludedArtifacts []*Artifact `json:"includedArtifacts,omitempty"`
 
 	meta.ReconcileRequestStatus `json:",inline"`
 }
@@ -153,17 +196,30 @@ func GitRepositoryProgressing(repository GitRepository) GitRepository {
 	repository.Status.ObservedGeneration = repository.Generation
 	repository.Status.URL = ""
 	repository.Status.Conditions = []metav1.Condition{}
-	meta.SetResourceCondition(&repository, meta.ReadyCondition, metav1.ConditionUnknown, meta.ProgressingReason, "reconciliation in progress")
+	newCondition := metav1.Condition{
+		Type:    meta.ReadyCondition,
+		Status:  metav1.ConditionUnknown,
+		Reason:  meta.ProgressingReason,
+		Message: "reconciliation in progress",
+	}
+	apimeta.SetStatusCondition(repository.GetStatusConditions(), newCondition)
 	return repository
 }
 
 // GitRepositoryReady sets the given Artifact and URL on the GitRepository and
 // sets the meta.ReadyCondition to 'True', with the given reason and message. It
 // returns the modified GitRepository.
-func GitRepositoryReady(repository GitRepository, artifact Artifact, url, reason, message string) GitRepository {
+func GitRepositoryReady(repository GitRepository, artifact Artifact, includedArtifacts []*Artifact, url, reason, message string) GitRepository {
 	repository.Status.Artifact = &artifact
+	repository.Status.IncludedArtifacts = includedArtifacts
 	repository.Status.URL = url
-	meta.SetResourceCondition(&repository, meta.ReadyCondition, metav1.ConditionTrue, reason, message)
+	newCondition := metav1.Condition{
+		Type:    meta.ReadyCondition,
+		Status:  metav1.ConditionTrue,
+		Reason:  reason,
+		Message: message,
+	}
+	apimeta.SetStatusCondition(repository.GetStatusConditions(), newCondition)
 	return repository
 }
 
@@ -171,7 +227,13 @@ func GitRepositoryReady(repository GitRepository, artifact Artifact, url, reason
 // to 'False', with the given reason and message. It returns the modified
 // GitRepository.
 func GitRepositoryNotReady(repository GitRepository, reason, message string) GitRepository {
-	meta.SetResourceCondition(&repository, meta.ReadyCondition, metav1.ConditionFalse, reason, message)
+	newCondition := metav1.Condition{
+		Type:    meta.ReadyCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: message,
+	}
+	apimeta.SetStatusCondition(repository.GetStatusConditions(), newCondition)
 	return repository
 }
 
@@ -205,6 +267,7 @@ func (in *GitRepository) GetInterval() metav1.Duration {
 // +genclient
 // +genclient:Namespaced
 // +kubebuilder:object:root=true
+// +kubebuilder:resource:shortName=gitrepo
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="URL",type=string,JSONPath=`.spec.url`
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type==\"Ready\")].status",description=""
@@ -216,7 +279,8 @@ type GitRepository struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   GitRepositorySpec   `json:"spec,omitempty"`
+	Spec GitRepositorySpec `json:"spec,omitempty"`
+	// +kubebuilder:default={"observedGeneration":-1}
 	Status GitRepositoryStatus `json:"status,omitempty"`
 }
 

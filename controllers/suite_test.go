@@ -17,6 +17,10 @@ limitations under the License.
 package controllers
 
 import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
 	"io/ioutil"
 	"math/rand"
 	"os"
@@ -24,155 +28,292 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"golang.org/x/crypto/bcrypt"
 	"helm.sh/helm/v3/pkg/getter"
+	helmreg "helm.sh/helm/v3/pkg/registry"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	"sigs.k8s.io/controller-runtime/pkg/envtest/printer"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	sourcev1 "github.com/fluxcd/source-controller/api/v1beta1"
+	"github.com/fluxcd/pkg/runtime/controller"
+	feathelper "github.com/fluxcd/pkg/runtime/features"
+	"github.com/fluxcd/pkg/runtime/testenv"
+	"github.com/fluxcd/pkg/testserver"
+	"github.com/phayes/freeport"
+
+	"github.com/distribution/distribution/v3/configuration"
+	dockerRegistry "github.com/distribution/distribution/v3/registry"
+	_ "github.com/distribution/distribution/v3/registry/auth/htpasswd"
+	_ "github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
+
+	sourcev1 "github.com/fluxcd/source-controller/api/v1beta2"
+	"github.com/fluxcd/source-controller/internal/cache"
+	"github.com/fluxcd/source-controller/internal/features"
+	"github.com/fluxcd/source-controller/internal/helm/registry"
+	"github.com/fluxcd/source-controller/pkg/git/libgit2/managed"
 	// +kubebuilder:scaffold:imports
 )
 
-// These tests use Ginkgo (BDD-style Go testing framework). Refer to
-// http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
+// These tests make use of plain Go using Gomega for assertions.
+// At the beginning of every (sub)test Gomega can be initialized
+// using gomega.NewWithT.
+// Refer to http://onsi.github.io/gomega/ to learn more about
+// Gomega.
 
-var cfg *rest.Config
-var k8sClient client.Client
-var k8sManager ctrl.Manager
-var testEnv *envtest.Environment
-var storage *Storage
+const (
+	timeout          = 10 * time.Second
+	interval         = 1 * time.Second
+	retentionTTL     = 2 * time.Second
+	retentionRecords = 2
+)
 
-var examplePublicKey []byte
-var examplePrivateKey []byte
-var exampleCA []byte
+const (
+	testRegistryHtpasswdFileBasename = "authtest.htpasswd"
+	testRegistryUsername             = "myuser"
+	testRegistryPassword             = "mypass"
+)
 
-func TestAPIs(t *testing.T) {
-	RegisterFailHandler(Fail)
+var (
+	testEnv      *testenv.Environment
+	testStorage  *Storage
+	testServer   *testserver.ArtifactServer
+	testMetricsH controller.Metrics
+	ctx          = ctrl.SetupSignalHandler()
+)
 
-	RunSpecsWithDefaultAndCustomReporters(t,
-		"Controller Suite",
-		[]Reporter{printer.NewlineReporter{}})
-}
-
-var _ = BeforeSuite(func(done Done) {
-	logf.SetLogger(zap.LoggerTo(GinkgoWriter, true))
-
-	By("bootstrapping test environment")
-	t := true
-	if os.Getenv("TEST_USE_EXISTING_CLUSTER") == "true" {
-		testEnv = &envtest.Environment{
-			UseExistingCluster: &t,
-		}
-	} else {
-		testEnv = &envtest.Environment{
-			CRDDirectoryPaths: []string{filepath.Join("..", "config", "crd", "bases")},
-		}
-	}
-
-	var err error
-	cfg, err = testEnv.Start()
-	Expect(err).ToNot(HaveOccurred())
-	Expect(cfg).ToNot(BeNil())
-
-	err = sourcev1.AddToScheme(scheme.Scheme)
-	Expect(err).NotTo(HaveOccurred())
-
-	err = sourcev1.AddToScheme(scheme.Scheme)
-	Expect(err).NotTo(HaveOccurred())
-
-	err = sourcev1.AddToScheme(scheme.Scheme)
-	Expect(err).NotTo(HaveOccurred())
-
-	// +kubebuilder:scaffold:scheme
-
-	Expect(loadExampleKeys()).To(Succeed())
-
-	tmpStoragePath, err := ioutil.TempDir("", "source-controller-storage-")
-	Expect(err).NotTo(HaveOccurred(), "failed to create tmp storage dir")
-
-	storage, err = NewStorage(tmpStoragePath, "localhost", time.Second*30)
-	Expect(err).NotTo(HaveOccurred(), "failed to create tmp storage")
-
-	k8sManager, err = ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme.Scheme,
-	})
-	Expect(err).ToNot(HaveOccurred())
-
-	err = (&GitRepositoryReconciler{
-		Client:  k8sManager.GetClient(),
-		Log:     ctrl.Log.WithName("controllers").WithName(sourcev1.GitRepositoryKind),
-		Scheme:  scheme.Scheme,
-		Storage: storage,
-	}).SetupWithManager(k8sManager)
-	Expect(err).ToNot(HaveOccurred(), "failed to setup GtRepositoryReconciler")
-
-	err = (&HelmRepositoryReconciler{
-		Client:  k8sManager.GetClient(),
-		Log:     ctrl.Log.WithName("controllers").WithName(sourcev1.HelmRepositoryKind),
-		Scheme:  scheme.Scheme,
-		Storage: storage,
-		Getters: getter.Providers{getter.Provider{
+var (
+	testGetters = getter.Providers{
+		getter.Provider{
 			Schemes: []string{"http", "https"},
 			New:     getter.NewHTTPGetter,
-		}},
-	}).SetupWithManager(k8sManager)
-	Expect(err).ToNot(HaveOccurred(), "failed to setup HelmRepositoryReconciler")
-
-	err = (&HelmChartReconciler{
-		Client:  k8sManager.GetClient(),
-		Log:     ctrl.Log.WithName("controllers").WithName(sourcev1.HelmChartKind),
-		Scheme:  scheme.Scheme,
-		Storage: storage,
-		Getters: getter.Providers{getter.Provider{
-			Schemes: []string{"http", "https"},
-			New:     getter.NewHTTPGetter,
-		}},
-	}).SetupWithManager(k8sManager)
-	Expect(err).ToNot(HaveOccurred(), "failed to setup HelmChartReconciler")
-
-	go func() {
-		err = k8sManager.Start(ctrl.SetupSignalHandler())
-		Expect(err).ToNot(HaveOccurred())
-	}()
-
-	k8sClient = k8sManager.GetClient()
-	Expect(k8sClient).ToNot(BeNil())
-
-	close(done)
-}, 60)
-
-var _ = AfterSuite(func() {
-	By("tearing down the test environment")
-	if storage != nil {
-		err := os.RemoveAll(storage.BasePath)
-		Expect(err).NotTo(HaveOccurred())
+		},
+		getter.Provider{
+			Schemes: []string{"oci"},
+			New:     getter.NewOCIGetter,
+		},
 	}
-	err := testEnv.Stop()
-	Expect(err).ToNot(HaveOccurred())
-})
+)
+
+var (
+	tlsPublicKey  []byte
+	tlsPrivateKey []byte
+	tlsCA         []byte
+)
+
+var (
+	testRegistryServer *registryClientTestServer
+	testCache          *cache.Cache
+)
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
-func loadExampleKeys() (err error) {
-	examplePublicKey, err = ioutil.ReadFile("testdata/certs/server.pem")
+type registryClientTestServer struct {
+	out            io.Writer
+	registryHost   string
+	workspaceDir   string
+	registryClient *helmreg.Client
+}
+
+func setupRegistryServer(ctx context.Context) (*registryClientTestServer, error) {
+	server := &registryClientTestServer{}
+
+	// Create a temporary workspace directory for the registry
+	workspaceDir, err := os.MkdirTemp("", "registry-test-")
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to create workspace directory: %w", err)
 	}
-	examplePrivateKey, err = ioutil.ReadFile("testdata/certs/server-key.pem")
+	server.workspaceDir = workspaceDir
+
+	var out bytes.Buffer
+	server.out = &out
+
+	// init test client
+	server.registryClient, err = helmreg.NewClient(
+		helmreg.ClientOptDebug(true),
+		helmreg.ClientOptWriter(server.out),
+	)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to create registry client: %s", err)
 	}
-	exampleCA, err = ioutil.ReadFile("testdata/certs/ca.pem")
-	return err
+
+	// create htpasswd file (w BCrypt, which is required)
+	pwBytes, err := bcrypt.GenerateFromPassword([]byte(testRegistryPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate password: %s", err)
+	}
+
+	htpasswdPath := filepath.Join(workspaceDir, testRegistryHtpasswdFileBasename)
+	err = ioutil.WriteFile(htpasswdPath, []byte(fmt.Sprintf("%s:%s\n", testRegistryUsername, string(pwBytes))), 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create htpasswd file: %s", err)
+	}
+
+	// Registry config
+	config := &configuration.Configuration{}
+	port, err := freeport.GetFreePort()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get free port: %s", err)
+	}
+
+	server.registryHost = fmt.Sprintf("localhost:%d", port)
+	config.HTTP.Addr = fmt.Sprintf("127.0.0.1:%d", port)
+	config.HTTP.DrainTimeout = time.Duration(10) * time.Second
+	config.Storage = map[string]configuration.Parameters{"inmemory": map[string]interface{}{}}
+	config.Auth = configuration.Auth{
+		"htpasswd": configuration.Parameters{
+			"realm": "localhost",
+			"path":  htpasswdPath,
+		},
+	}
+	dockerRegistry, err := dockerRegistry.NewRegistry(ctx, config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create docker registry: %w", err)
+	}
+
+	// Start Docker registry
+	go dockerRegistry.ListenAndServe()
+
+	return server, nil
+}
+
+func TestMain(m *testing.M) {
+	initTestTLS()
+
+	utilruntime.Must(sourcev1.AddToScheme(scheme.Scheme))
+
+	testEnv = testenv.New(testenv.WithCRDPath(filepath.Join("..", "config", "crd", "bases")))
+
+	var err error
+	testServer, err = testserver.NewTempArtifactServer()
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create a temporary storage server: %v", err))
+	}
+	fmt.Println("Starting the test storage server")
+	testServer.Start()
+
+	testStorage, err = newTestStorage(testServer.HTTPServer)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create a test storage: %v", err))
+	}
+
+	testMetricsH = controller.MustMakeMetrics(testEnv)
+
+	testRegistryServer, err = setupRegistryServer(ctx)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create a test registry server: %v", err))
+	}
+
+	fg := feathelper.FeatureGates{}
+	fg.SupportedFeatures(features.FeatureGates())
+	managed.InitManagedTransport()
+
+	if err := (&GitRepositoryReconciler{
+		Client:        testEnv,
+		EventRecorder: record.NewFakeRecorder(32),
+		Metrics:       testMetricsH,
+		Storage:       testStorage,
+		features:      features.FeatureGates(),
+	}).SetupWithManager(testEnv); err != nil {
+		panic(fmt.Sprintf("Failed to start GitRepositoryReconciler: %v", err))
+	}
+
+	if err := (&BucketReconciler{
+		Client:        testEnv,
+		EventRecorder: record.NewFakeRecorder(32),
+		Metrics:       testMetricsH,
+		Storage:       testStorage,
+	}).SetupWithManager(testEnv); err != nil {
+		panic(fmt.Sprintf("Failed to start BucketReconciler: %v", err))
+	}
+
+	if err := (&HelmRepositoryReconciler{
+		Client:        testEnv,
+		EventRecorder: record.NewFakeRecorder(32),
+		Metrics:       testMetricsH,
+		Getters:       testGetters,
+		Storage:       testStorage,
+	}).SetupWithManager(testEnv); err != nil {
+		panic(fmt.Sprintf("Failed to start HelmRepositoryReconciler: %v", err))
+	}
+
+	if err = (&HelmRepositoryOCIReconciler{
+		Client:                  testEnv,
+		EventRecorder:           record.NewFakeRecorder(32),
+		Metrics:                 testMetricsH,
+		Getters:                 testGetters,
+		RegistryClientGenerator: registry.ClientGenerator,
+	}).SetupWithManager(testEnv); err != nil {
+		panic(fmt.Sprintf("Failed to start HelmRepositoryOCIReconciler: %v", err))
+	}
+
+	testCache = cache.New(5, 1*time.Second)
+	cacheRecorder := cache.MustMakeMetrics()
+	if err := (&HelmChartReconciler{
+		Client:        testEnv,
+		EventRecorder: record.NewFakeRecorder(32),
+		Metrics:       testMetricsH,
+		Getters:       testGetters,
+		Storage:       testStorage,
+		Cache:         testCache,
+		TTL:           1 * time.Second,
+		CacheRecorder: cacheRecorder,
+	}).SetupWithManager(testEnv); err != nil {
+		panic(fmt.Sprintf("Failed to start HelmRepositoryReconciler: %v", err))
+	}
+
+	go func() {
+		fmt.Println("Starting the test environment")
+		if err := testEnv.Start(ctx); err != nil {
+			panic(fmt.Sprintf("Failed to start the test environment manager: %v", err))
+		}
+	}()
+	<-testEnv.Manager.Elected()
+
+	code := m.Run()
+
+	fmt.Println("Stopping the test environment")
+	if err := testEnv.Stop(); err != nil {
+		panic(fmt.Sprintf("Failed to stop the test environment: %v", err))
+	}
+
+	fmt.Println("Stopping the storage server")
+	testServer.Stop()
+	if err := os.RemoveAll(testServer.Root()); err != nil {
+		panic(fmt.Sprintf("Failed to remove storage server dir: %v", err))
+	}
+
+	if err := os.RemoveAll(testRegistryServer.workspaceDir); err != nil {
+		panic(fmt.Sprintf("Failed to remove registry workspace dir: %v", err))
+	}
+
+	os.Exit(code)
+}
+
+func initTestTLS() {
+	var err error
+	tlsPublicKey, err = os.ReadFile("testdata/certs/server.pem")
+	if err != nil {
+		panic(err)
+	}
+	tlsPrivateKey, err = os.ReadFile("testdata/certs/server-key.pem")
+	if err != nil {
+		panic(err)
+	}
+	tlsCA, err = os.ReadFile("testdata/certs/ca.pem")
+	if err != nil {
+		panic(err)
+	}
+}
+
+func newTestStorage(s *testserver.HTTPServer) (*Storage, error) {
+	storage, err := NewStorage(s.Root(), s.URL(), retentionTTL, retentionRecords)
+	if err != nil {
+		return nil, err
+	}
+	return storage, nil
 }
 
 var letterRunes = []rune("abcdefghijklmnopqrstuvwxyz1234567890")
@@ -183,4 +324,8 @@ func randStringRunes(n int) string {
 		b[i] = letterRunes[rand.Intn(len(letterRunes))]
 	}
 	return string(b)
+}
+
+func int64p(i int64) *int64 {
+	return &i
 }

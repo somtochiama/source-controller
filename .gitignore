@@ -14,4 +14,8 @@
 # Dependency directories (remove the comment below to include it)
 # vendor/
 bin/
+testbin/
 config/release/
+
+# Exclude temporary build files
+build/

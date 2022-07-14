@@ -20,7 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	sourcev1 "github.com/fluxcd/source-controller/api/v1beta1"
+	sourcev1 "github.com/fluxcd/source-controller/api/v1beta2"
 )
 
 type SourceRevisionChangePredicate struct {
@@ -28,7 +28,7 @@ type SourceRevisionChangePredicate struct {
 }
 
 func (SourceRevisionChangePredicate) Update(e event.UpdateEvent) bool {
-	if e.MetaOld == nil || e.MetaNew == nil {
+	if e.ObjectOld == nil || e.ObjectNew == nil {
 		return false
 	}
 

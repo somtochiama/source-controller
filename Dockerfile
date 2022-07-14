@@ -1,46 +1,112 @@
-# Docker buildkit multi-arch build requires golang alpine
-FROM golang:1.15-alpine as builder
+ARG BASE_VARIANT=alpine
+ARG GO_VERSION=1.17
+ARG XX_VERSION=1.1.0
 
-RUN apk add gcc pkgconfig libc-dev
-RUN apk add --no-cache --repository http://dl-cdn.alpinelinux.org/alpine/edge/community libgit2-dev~=1.1.0
+ARG LIBGIT2_IMG=ghcr.io/fluxcd/golang-with-libgit2-all
+ARG LIBGIT2_TAG=v0.1.1
 
+FROM ${LIBGIT2_IMG}:${LIBGIT2_TAG} AS libgit2-libs
+
+FROM --platform=$BUILDPLATFORM tonistiigi/xx:${XX_VERSION} AS xx
+
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-${BASE_VARIANT} as gostable
+
+FROM gostable AS go-linux
+
+# Build-base consists of build platform dependencies and xx.
+# These will be used at current arch to yield execute the cross compilations.
+FROM go-${TARGETOS} AS build-base
+
+RUN apk add --no-cache clang lld pkgconfig
+
+COPY --from=xx / /
+
+# build-go-mod can still be cached at build platform architecture.
+FROM build-base as build-go-mod
+
+# Configure workspace
 WORKDIR /workspace
 
-# copy api submodule
+# Copy api submodule
 COPY api/ api/
 
-# copy modules manifests
+# Copy modules manifests
 COPY go.mod go.mod
 COPY go.sum go.sum
 
-# cache modules
+# Cache modules
 RUN go mod download
 
-# copy source code
+# The musl-tool-chain layer is an adhoc solution
+# for the problem in which xx gets confused during compilation
+# and a) looks for gold linker and then b) cannot find musl's dynamic linker.
+FROM --platform=$BUILDPLATFORM alpine as musl-tool-chain
+
+COPY --from=xx / /
+
+RUN apk add bash curl tar
+
+WORKDIR /workspace
+COPY hack/download-musl.sh .
+
+ARG TARGETPLATFORM
+ARG TARGETARCH
+RUN ROOT_DIR="$(pwd)" TARGET_ARCH="$(xx-info alpine-arch)" ENV_FILE=true \
+        ./download-musl.sh
+
+# Build stage install per target platform
+# dependency and effectively cross compile the application.
+FROM build-go-mod as build
+
+ARG TARGETPLATFORM
+
+COPY --from=libgit2-libs /usr/local/ /usr/local/
+
+# Some dependencies have to installed 
+# for the target platform: https://github.com/tonistiigi/xx#go--cgo
+RUN xx-apk add musl-dev gcc lld
+
+WORKDIR /workspace
+
+# Copy source code
 COPY main.go main.go
 COPY controllers/ controllers/
 COPY pkg/ pkg/
 COPY internal/ internal/
 
-# build without specifing the arch
-RUN CGO_ENABLED=1 go build -o source-controller main.go
+COPY --from=musl-tool-chain /workspace/build /workspace/build
 
-FROM alpine:3.12
+ARG TARGETPLATFORM
+ARG TARGETARCH
+ENV CGO_ENABLED=1
 
-# link repo to the GitHub Container Registry image
-LABEL org.opencontainers.image.source="https://github.com/fluxcd/source-controller"
+# Instead of using xx-go, (cross) compile with vanilla go leveraging musl tool chain.
+RUN export $(cat build/musl/$(xx-info alpine-arch).env | xargs) && \
+    export LIBRARY_PATH="/usr/local/$(xx-info triple):/usr/local/$(xx-info triple)/lib64" && \
+    export PKG_CONFIG_PATH="/usr/local/$(xx-info triple)/lib/pkgconfig:/usr/local/$(xx-info triple)/lib64/pkgconfig" && \
+    export CGO_LDFLAGS="$(pkg-config --static --libs --cflags libssh2 openssl libgit2) -static" && \
+    GOARCH=$TARGETARCH go build  \
+        -ldflags "-s -w" \
+        -tags 'netgo,osusergo,static_build' \
+        -o /source-controller -trimpath main.go;
 
-RUN apk add --no-cache ca-certificates tini
-RUN apk add --no-cache --repository http://dl-cdn.alpinelinux.org/alpine/edge/community libgit2-dev~=1.1.0
+# Ensure that the binary was cross-compiled correctly to the target platform.
+RUN xx-verify --static /source-controller
 
-COPY --from=builder /workspace/source-controller /usr/local/bin/
+
+FROM alpine:3.16
+
+ARG TARGETPLATFORM
+RUN apk --no-cache add ca-certificates \
+  && update-ca-certificates
 
 # Create minimal nsswitch.conf file to prioritize the usage of /etc/hosts over DNS queries.
 # https://github.com/gliderlabs/docker-alpine/issues/367#issuecomment-354316460
 RUN [ ! -e /etc/nsswitch.conf ] && echo 'hosts: files dns' > /etc/nsswitch.conf
 
-RUN addgroup -S controller && adduser -S -g controller controller
+# Copy over binary from build
+COPY --from=build /source-controller /usr/local/bin/
+COPY ATTRIBUTIONS.md /
 
-USER controller
-
-ENTRYPOINT [ "/sbin/tini", "--", "source-controller" ]
+USER 65534:65534
+ENTRYPOINT [ "source-controller" ]
