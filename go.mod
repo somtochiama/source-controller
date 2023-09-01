@@ -373,3 +373,5 @@ require (
 )
 
 retract v0.32.0 // Refers to incorrect ./api version.
+
+replace github.com/fluxcd/pkg/oci => ../pkg/oci

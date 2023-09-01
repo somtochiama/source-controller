@@ -22,7 +22,12 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/fluxcd/pkg/oci"
+	"github.com/fluxcd/pkg/oci/auth/login"
 	"io"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -44,6 +49,7 @@ import (
 	kuberecorder "k8s.io/client-go/tools/record"
 	"k8s.io/utils/pointer"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -54,7 +60,7 @@ import (
 
 	eventv1 "github.com/fluxcd/pkg/apis/event/v1beta1"
 	"github.com/fluxcd/pkg/apis/meta"
-	"github.com/fluxcd/pkg/oci"
+	"github.com/fluxcd/pkg/oci/auth/azure"
 	"github.com/fluxcd/pkg/runtime/conditions"
 	helper "github.com/fluxcd/pkg/runtime/controller"
 	"github.com/fluxcd/pkg/runtime/patch"
@@ -347,7 +353,57 @@ func (r *OCIRepositoryReconciler) reconcileSource(ctx context.Context, sp *patch
 
 	if _, ok := keychain.(soci.Anonymous); obj.Spec.Provider != ociv1.GenericOCIProvider && ok {
 		var authErr error
-		auth, authErr = soci.OIDCAuth(ctxTimeout, obj.Spec.URL, obj.Spec.Provider)
+		var opts azidentity.WorkloadIdentityCredentialOptions
+		var managerOpts []login.ManagerOptFunc
+		if obj.Spec.ServiceAccountName != "" {
+			tr := &authenticationv1.TokenRequest{}
+			sa := &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{Name: obj.Spec.ServiceAccountName, Namespace: obj.GetNamespace()},
+			}
+			if err := r.Get(ctx, types.NamespacedName{Namespace: sa.Namespace, Name: sa.Name}, sa); err != nil {
+				return sreconcile.ResultEmpty, err
+			}
+
+			clientID := sa.Annotations["azure.workload.identity/client-id"]
+			if clientID == "" {
+				return sreconcile.ResultEmpty, fmt.Errorf("no client id annotation on serviceaccount")
+			}
+			tenantID := sa.Annotations["azure.workload.identity/tenant-id"]
+			if clientID == "" {
+				return sreconcile.ResultEmpty, fmt.Errorf("no tenamt id annotation on serviceaccount")
+			}
+			if err := r.Client.SubResource("token").Create(ctx, sa, tr); err != nil {
+				return sreconcile.ResultEmpty, err
+			}
+			f, err := os.CreateTemp("", "token-*")
+			if err != nil {
+				return sreconcile.ResultEmpty, err
+			}
+			if _, err := f.Write([]byte(tr.Status.Token)); err != nil {
+				return sreconcile.ResultEmpty, err
+			}
+
+			opts = azidentity.WorkloadIdentityCredentialOptions{
+				ClientOptions:              azcore.ClientOptions{},
+				AdditionallyAllowedTenants: nil,
+				ClientID:                   clientID,
+				DisableInstanceDiscovery:   false,
+				TenantID:                   tenantID,
+				TokenFilePath:              f.Name(),
+			}
+			cred, err := azidentity.NewWorkloadIdentityCredential(&opts)
+			if err != nil {
+				return sreconcile.ResultEmpty, err
+			}
+			setWI := func(m *login.Manager) {
+				acrClient := azure.NewClient()
+				acrClient.WithTokenCredential(cred)
+				m.WithACRClient(acrClient)
+			}
+			managerOpts = append(managerOpts, setWI)
+		}
+
+		auth, authErr = soci.OIDCAuth(ctxTimeout, obj.Spec.URL, obj.Spec.Provider, managerOpts...)
 		if authErr != nil && !errors.Is(authErr, oci.ErrUnconfiguredProvider) {
 			e := serror.NewGeneric(
 				fmt.Errorf("failed to get credential from %s: %w", obj.Spec.Provider, authErr),

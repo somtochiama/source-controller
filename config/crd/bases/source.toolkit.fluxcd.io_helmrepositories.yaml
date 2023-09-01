@@ -348,7 +348,8 @@ spec:
               serviceAccountName:
                 description: 'ServiceAccountName is the name of the Kubernetes ServiceAccount
                   used to authenticate the OCI image pull if the service account has
-                  attached pull secrets. For more information: https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/#add-imagepullsecrets-to-a-service-account'
+                  attached pull secrets. For more information: https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/#add-imagepullsecrets-to-a-service-account
+                  This field is only considered for Helm Repositories of type oci'
                 type: string
               suspend:
                 description: Suspend tells the controller to suspend the reconciliation

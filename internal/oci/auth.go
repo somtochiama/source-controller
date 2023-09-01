@@ -40,7 +40,7 @@ func (a Anonymous) Resolve(_ authn.Resource) (authn.Authenticator, error) {
 }
 
 // OIDCAuth generates the OIDC credential authenticator based on the specified cloud provider.
-func OIDCAuth(ctx context.Context, url, provider string) (authn.Authenticator, error) {
+func OIDCAuth(ctx context.Context, url, provider string, mopts ...login.ManagerOptFunc) (authn.Authenticator, error) {
 	u := strings.TrimPrefix(url, sourcev1.OCIRepositoryPrefix)
 	ref, err := name.ParseReference(u)
 	if err != nil {
@@ -57,5 +57,9 @@ func OIDCAuth(ctx context.Context, url, provider string) (authn.Authenticator, e
 		opts.GcpAutoLogin = true
 	}
 
-	return login.NewManager().Login(ctx, u, ref, opts)
+	manager := login.NewManager()
+	for _, o := range mopts {
+		o(manager)
+	}
+	return manager.Login(ctx, u, ref, opts)
 }

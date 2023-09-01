@@ -20,10 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/docker/go-units"
 	"net/url"
 	"time"
 
-	"github.com/docker/go-units"
 	"github.com/opencontainers/go-digest"
 	helmgetter "helm.sh/helm/v3/pkg/getter"
 	corev1 "k8s.io/api/core/v1"
