@@ -34,13 +34,16 @@ import (
 // It implements authn.Keychain `Resolve` method and can be used as a keychain.
 type Anonymous authn.AuthConfig
 
+// ManagerOptFunc is used for setting the cloud provider's client in login.Manager
+type ManagerOptFunc func(m *login.Manager)
+
 // Resolve implements authn.Keychain.
 func (a Anonymous) Resolve(_ authn.Resource) (authn.Authenticator, error) {
 	return authn.Anonymous, nil
 }
 
 // OIDCAuth generates the OIDC credential authenticator based on the specified cloud provider.
-func OIDCAuth(ctx context.Context, url, provider string, mopts ...login.ManagerOptFunc) (authn.Authenticator, error) {
+func OIDCAuth(ctx context.Context, url, provider string, mopts ...ManagerOptFunc) (authn.Authenticator, error) {
 	u := strings.TrimPrefix(url, sourcev1.OCIRepositoryPrefix)
 	ref, err := name.ParseReference(u)
 	if err != nil {
